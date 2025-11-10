@@ -9989,19 +9989,34 @@ Decl *ClangImporter::Implementation::importDeclAndCacheImpl(
   startedImportingEntity();
   Decl *Result = importDeclImpl(ClangDecl, version, TypedefIsSuperfluous,
                                 HadForwardDeclaration);
-  if (!Result) {
-    ImportedDecls[{Canon, version}] = nullptr;
-    return nullptr;
-  }
 
-  if (TypedefIsSuperfluous) {
+  if (Result && TypedefIsSuperfluous) {
     SuperfluousTypedefs.insert(Canon);
     if (auto tagDecl = dyn_cast_or_null<clang::TagDecl>(Result->getClangDecl()))
       DeclsWithSuperfluousTypedefs.insert(tagDecl);
   }
 
-  if (!HadForwardDeclaration)
-    ImportedDecls[{Canon, version}] = Result;
+  if (!HadForwardDeclaration) {
+    auto it = ImportedDecls.try_emplace({Canon, version}, Result);
+    if (!it.second && Result != it.first->second) {
+      ABORT([&](auto &out) {
+        out << "Imported the same clang::Decl twice: '";
+        ClangDecl->getNameForDiagnostic(out, {{}}, true);
+        out << "' ";
+        ClangDecl->getSourceRange().print(out, Instance->getSourceManager());
+        if (ClangDecl != Canon) {
+          out << "\nCanonical clang::Decl: '";
+          Canon->getNameForDiagnostic(out, {{}}, true);
+          out << "' ";
+          Canon->getSourceRange().print(out, Instance->getSourceManager());
+        }
+        out << "\nImported as Swift Decl:\n";
+        Result->dump(out, 4);
+        out << "\nPreviously imported as Swift Decl:\n";
+        it.first->second->dump(out, 4);
+      });
+    }
+  }
 
   if (!SuperfluousTypedefsAreTransparent && TypedefIsSuperfluous)
     return nullptr;
