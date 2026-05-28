@@ -2484,16 +2484,35 @@ ModuleFile::resolveCrossReference(ModuleID MID, uint32_t pathLen) {
                                                        pathTrace,
                                                        mismatchingTypes);
 
-    // If we want to workaround broken modularization, we can keep going if
-    // we found a matching top-level decl in a different module. The risk
-    // here would be to pick an unrelated decl that happens to share the same
-    // signature. Even if we recover, print as a warning the errors we skip.
-    if (getContext().LangOpts.EnableWorkaroundBrokenModules &&
+    auto *clangLoader = getContext().getClangModuleLoader();
+    auto *ObjCModule = clangLoader ? clangLoader->getImportedHeaderModule()
+                                     : nullptr;
+    bool declMovedFromObjCModule =
         errorKind == ModularizationError::Kind::DeclMoved &&
-        baseModule->findUnderlyingClangModule() &&
-        foundIn->findUnderlyingClangModule() &&
-        !values.empty()) {
-      // Print the error as a warning and notify of the recovery attempt.
+        ObjCModule && baseModule == ObjCModule &&
+        foundIn && foundIn->findUnderlyingClangModule();
+
+    auto recoveredIsCxxNamespace = [&values]() {
+      if (values.empty())
+        return false;
+      auto *ed = dyn_cast<EnumDecl>(values.front());
+      return ed && isa_and_nonnull<clang::NamespaceDecl>(ed->getClangDecl());
+    };
+
+    if (declMovedFromObjCModule && recoveredIsCxxNamespace()) {
+      // C++ namespaces are filed under `__ObjC` by VisitNamespaceDecl but are
+      // also reachable through their owning Clang module's SwiftLookupTable,
+      // so the `DeclMoved` we get when the XRef says `__ObjC` and we find the
+      // namespace in another Clang module is spurious. Recover silently.
+      llvm::consumeError(std::move(error));
+    } else if (getContext().LangOpts.EnableWorkaroundBrokenModules &&
+               errorKind == ModularizationError::Kind::DeclMoved &&
+               baseModule->findUnderlyingClangModule() &&
+               foundIn->findUnderlyingClangModule() && !values.empty()) {
+      // Workaround broken modularization: keep going if we found a matching
+      // top-level decl in a different module. The risk here would be to pick
+      // an unrelated decl that happens to share the same signature, so we print
+      // the errors we skip as a warning and notify the user of the recovery.
       llvm::handleAllErrors(std::move(error),
         [&](const ModularizationError &modularError) {
           modularError.diagnose(this, DiagnosticBehavior::Warning);
