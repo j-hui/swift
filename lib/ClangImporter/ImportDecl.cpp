@@ -179,10 +179,6 @@ void ClangImporter::Implementation::makeComputed(AbstractStorageDecl *storage,
   }
 }
 
-bool importer::hasAnyImmortalAttr(const clang::RecordDecl *decl) {
-  return hasSwiftAttribute(decl, {"retain:immortal", "release:immortal"});
-}
-
 importer::ReturnOwnershipInfo::ReturnOwnershipInfo(
     const clang::NamedDecl *decl) {
   if (!decl->hasAttrs())
@@ -2291,37 +2287,38 @@ namespace {
     std::pair<CustomRefCountingOperationResult,
               CustomRefCountingOperationResult>
     addRefCountOperationsIfRequired(ClassDecl *nominal,
-                                    clang::RecordDecl *clangType) {
+                                    clang::RecordDecl *decl) {
       auto &context = Impl.SwiftContext;
-      auto nonInheritedRefCountingOperations = [&] {
-        auto retainResult = evaluateOrDefault(
-            context.evaluator,
-            CustomRefCountingOperation(
-                {nominal, CustomRefCountingOperationKind::retain}),
-            {});
-        auto releaseResult = evaluateOrDefault(
-            context.evaluator,
-            CustomRefCountingOperation(
-                {nominal, CustomRefCountingOperationKind::release}),
-            {});
-        return std::make_pair(retainResult, releaseResult);
-      };
-      auto clangDecl = dyn_cast<clang::CXXRecordDecl>(clangType);
-      if (!clangDecl)
-        return nonInheritedRefCountingOperations();
+      auto FRTInfo = evaluateOrDefault(
+          context.evaluator, ForeignReferenceTypeInfoRequest({decl}), {});
 
-      auto frtInfo = evaluateOrDefault(
-          context.evaluator, ForeignReferenceTypeInfoRequest({clangDecl}), {});
-      auto *baseClangDecl =
-          dyn_cast_or_null<clang::CXXRecordDecl>(frtInfo.getDecl());
-      if (!baseClangDecl || baseClangDecl == clangDecl)
-        return nonInheritedRefCountingOperations();
+      ASSERT(FRTInfo.isReference() && "decl should have reference semantics");
 
-      auto baseSwiftDecl = cast<ClassDecl>(
-          Impl.importDecl(baseClangDecl, getActiveSwiftVersion()));
+      if (FRTInfo.isShared()) {
+        auto *FRTBase =
+            dyn_cast_or_null<clang::CXXRecordDecl>(FRTInfo.getSharedFRTBase());
+        if (auto *CxxDecl = dyn_cast<clang::CXXRecordDecl>(decl);
+            CxxDecl && FRTBase && CxxDecl != FRTBase) {
+          // Shared FRTBase is inherited, so we need to synthesize refcounting
+          // operations to ensure the offsets are computed correctly.
+          auto baseSwiftDecl = cast<ClassDecl>(
+              Impl.importDecl(FRTBase, getActiveSwiftVersion()));
+          return synthesizer.addRefCountOperations(nominal, CxxDecl,
+                                                   baseSwiftDecl, FRTBase);
+        }
+      }
 
-      return synthesizer.addRefCountOperations(nominal, clangDecl,
-                                               baseSwiftDecl, baseClangDecl);
+      auto retainResult = evaluateOrDefault(
+          context.evaluator,
+          CustomRefCountingOperation(
+              {nominal, CustomRefCountingOperationKind::retain}),
+          {});
+      auto releaseResult = evaluateOrDefault(
+          context.evaluator,
+          CustomRefCountingOperation(
+              {nominal, CustomRefCountingOperationKind::release}),
+          {});
+      return std::make_pair(retainResult, releaseResult);
     }
 
     void addSuppressedProtocol(TypeDecl *D, KnownProtocolKind kind) const {
@@ -3889,30 +3886,31 @@ namespace {
 
       auto attrInfo = importer::ReturnOwnershipInfo(decl);
       HeaderLoc loc(decl->getLocation());
+      auto FRTInfo =
+          evaluateOrDefault(Impl.SwiftContext.evaluator,
+                            ForeignReferenceTypeInfoRequest({recordDecl}), {});
 
-      if (recordDecl && recordHasReferenceSemantics(recordDecl) &&
-          !hasAnyImmortalAttr(recordDecl)) {
-        if (attrInfo.hasConflictingAttr()) {
-          Impl.diagnose(loc, diag::both_returns_retained_returns_unretained,
-                        decl);
-        } else if (const auto *methodDecl =
-                       dyn_cast<clang::CXXMethodDecl>(decl)) {
-          // Warning for annotated overloaded C++ operators as they currently
-          // follow Swift method's convention and always return owned.
-          if (methodDecl->isOverloadedOperator() && attrInfo.hasRetainAttr()) {
-            Impl.diagnose(
-                loc,
-                diag::
-                    returns_retained_returns_unretained_on_overloaded_operator,
-                decl);
-          }
+      if (attrInfo.hasConflictingAttr())
+        Impl.diagnose(loc, diag::both_returns_retained_returns_unretained,
+                      decl);
+
+      if (recordDecl && FRTInfo.isShared()) {
+        // Warning for annotated overloaded C++ operators as they currently
+        // follow Swift method's convention and always return owned.
+        if (const auto *methodDecl = dyn_cast<clang::CXXMethodDecl>(decl);
+            methodDecl && methodDecl->isOverloadedOperator() &&
+            attrInfo.hasRetainAttr()) {
+          Impl.diagnose(
+              loc,
+              diag::returns_retained_returns_unretained_on_overloaded_operator,
+              decl);
         }
       } else {
         if (attrInfo.hasRetainAttr()) {
           if (const auto *functionDecl = dyn_cast<clang::FunctionDecl>(decl)) {
-            // Skip diagnostics for template instantiations and template-dependent
-            // return types. We cannot determine at import time whether T or T* will
-            // be instantiated as a SWIFT_SHARED_REFERENCE type or not, so we avoid
+            // Skip diagnostics for template instantiations and dependent return
+            // types. We cannot determine at import time whether T or T* will be
+            // instantiated as a SWIFT_SHARED_REFERENCE type or not, so we avoid
             // emitting potentially incorrect warnings for these cases.
             if (functionDecl->isTemplateInstantiation() ||
                 functionDecl->getReturnType()->isInstantiationDependentType() ||

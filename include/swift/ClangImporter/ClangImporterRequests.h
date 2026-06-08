@@ -307,11 +307,11 @@ class ForeignReferenceTypeInfo {
   enum Flag {
     /// This type has (or inherits) valid reference type attributes, if any
     FlagIsValid = 1 << 0,
-    /// This type is a foreign reference type
+    /// This type is a foreign reference type (whether shared or immortal)
     FlagIsRef = 1 << 1,
   };
 
-  llvm::PointerIntPair<const clang::RecordDecl *, 2> BaseAndFlags;
+  llvm::PointerIntPair<const clang::RecordDecl *, 3> BaseAndFlags;
 
   const clang::CXXRecordDecl *primarySuperclass = nullptr;
 
@@ -342,6 +342,12 @@ public:
     return {decl, primarySuperclass, isValid, /*isRef=*/true};
   }
 
+  /// An immortal reference type.
+  static ForeignReferenceTypeInfo
+  Immortal(const clang::CXXRecordDecl *primarySuperclass, bool isValid = true) {
+    return {nullptr, primarySuperclass, isValid, /*isRef=*/true};
+  }
+
   /// The base decl that is annotated with the retain/release functions that
   /// this reference type uses.
   ///
@@ -350,7 +356,10 @@ public:
   /// ambiguity about which retain/release values to use).
   ///
   /// Returns \c nullptr for non-shared references.
-  const clang::RecordDecl *getDecl() const { return BaseAndFlags.getPointer(); }
+  const clang::RecordDecl *getSharedFRTBase() const {
+    ASSERT(isShared() && "should be a shared reference");
+    return BaseAndFlags.getPointer();
+  }
 
   /// All of its (and its bases') foreign reference type attributes (if any)
   /// are valid.
@@ -360,10 +369,18 @@ public:
   bool isValid() const { return BaseAndFlags.getInt() & FlagIsValid; }
 
   /// Whether this type or its bases have attributes that ask for it to be
-  /// imported as a reference type.
+  /// imported as a reference type (whether shared or immortal).
   ///
   /// This is independent of whether those attributes are actually valid.
   bool isReference() const { return BaseAndFlags.getInt() & FlagIsRef; }
+
+  /// Whether this is a shared reference type.
+  bool isShared() const {
+    return BaseAndFlags.getPointer() != nullptr && isReference();
+  }
+
+  /// Whether this is an immortal reference type.
+  bool isImmortal() const { return isReference() && !isShared(); }
 
   /// The single FRT base that is the primary (first) direct base of this
   /// type, suitable for use as the Swift superclass. Returns nullptr if there

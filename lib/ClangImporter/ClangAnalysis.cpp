@@ -26,6 +26,11 @@ bool importer::hasImportAsOpaquePointerAttr(const clang::RecordDecl *decl) {
          });
 }
 
+static bool hasAnyImmortalAttr(const clang::RecordDecl *decl) {
+  return importer::hasSwiftAttribute(decl,
+                                     {"retain:immortal", "release:immortal"});
+}
+
 namespace {
 class ForeignReferenceTypeChecker {
   /// We are checking this to determine whether it is a foreign reference type.
@@ -166,15 +171,17 @@ public:
     }
 
     const clang::CXXRecordDecl *FRTBase;
+    bool isImmortal;
     if (explicitlyAnnotated) {
       FRTBase = checkedDecl;
+      isImmortal = hasAnyImmortalAttr(FRTBase);
     } else {
       ASSERT(!FRTBases.empty() && "if checkedDecl wasn't explicitly annotated,"
                                   "at least one of its bases should be an FRT");
       FRTBase = nullptr;
       bool seenShared = false, seenMultipleShared = false, seenImmortal = false;
       for (auto *base : FRTBases) {
-        if (importer::hasAnyImmortalAttr(base)) {
+        if (hasAnyImmortalAttr(base)) {
           seenImmortal = true;
         } else if (!FRTBase) {
           FRTBase = base;
@@ -186,6 +193,7 @@ public:
 
       // If there are no shared references, FRTBase is the first immortal base
       FRTBase = FRTBase ? FRTBase : FRTBases.front();
+      isImmortal = seenImmortal && !seenShared;
 
       if (seenMultipleShared || (seenShared && seenImmortal)) {
         // checkedDecl is an invalid FRT, either because it has multiple shared
@@ -208,6 +216,8 @@ public:
     }
 
     ASSERT(FRTBase && "should have encountered FRTBase");
+    if (isImmortal)
+      return ForeignReferenceTypeInfo::Immortal(FRTBase, primarySuperclass);
     return ForeignReferenceTypeInfo::Shared(FRTBase, primarySuperclass);
   }
 };
@@ -233,6 +243,8 @@ swift::extractNearestSourceLoc(const ForeignReferenceTypeInfoDescriptor &desc) {
 ForeignReferenceTypeInfo ForeignReferenceTypeInfoRequest::evaluate(
     Evaluator &evaluator, ForeignReferenceTypeInfoDescriptor desc) const {
   auto *decl = desc.decl;
+  if (!decl)
+    return {};
 
   if (auto *cxxDecl = dyn_cast<clang::CXXRecordDecl>(decl))
     return ForeignReferenceTypeChecker(cxxDecl).check();
@@ -328,11 +340,13 @@ static void diagnoseMissingReturnsRetained(ClangImporter::Implementation &Impl,
   auto info =
       evaluateOrDefault(Impl.SwiftContext.evaluator,
                         ForeignReferenceTypeInfoRequest({recordDecl}), {});
-  if (!info.isReference() || importer::hasAnyImmortalAttr(recordDecl))
-    return; // recordDecl is not a shared reference type
+  if (!info.isValid() || !info.isShared())
+    // Return ownership annotations only apply to (valid) shared references
+    return;
 
   if (importer::matchSwiftAttr<bool>(
-          info.getDecl(), {{"returned_as_unretained_by_default", true}}))
+          info.getSharedFRTBase(),
+          {{"returned_as_unretained_by_default", true}}))
     return;
 
   // If we reached here, then we have a call to an unannotated, Clang-imported
