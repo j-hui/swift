@@ -2341,6 +2341,194 @@ applyImportTypeAttrs(ImportTypeAttrs attrs, Type type,
   return type;
 }
 
+/// If \p type names (possibly through aliases) the class template
+/// specialization \p spec, return the template arguments as written there.
+static ArrayRef<clang::TemplateArgument>
+getWrittenTemplateArgs(clang::QualType type,
+                       const clang::ClassTemplateSpecializationDecl *spec) {
+  auto *specTemplate = spec->getSpecializedTemplate()->getCanonicalDecl();
+  while (auto *tst = type->getAs<clang::TemplateSpecializationType>()) {
+    if (tst->isTypeAlias()) {
+      type = tst->getAliasedType();
+      continue;
+    }
+    auto *td = tst->getTemplateName().getAsTemplateDecl();
+    if (td && td->getCanonicalDecl() == specTemplate)
+      return tst->template_arguments();
+    break;
+  }
+  return {};
+}
+
+/// Search the (transitive) bases of \p record for a base specifier that names
+/// \p spec, and return the template arguments as written in that specifier.
+static ArrayRef<clang::TemplateArgument>
+findWrittenTemplateArgsInBases(const clang::CXXRecordDecl *record,
+                               const clang::ClassTemplateSpecializationDecl *spec,
+                               unsigned depth = 0) {
+  // Guard against pathologically deep hierarchies.
+  if (!record || depth > 32)
+    return {};
+  record = record->getDefinition();
+  if (!record)
+    return {};
+  for (const auto &base : record->bases()) {
+    clang::QualType baseTy = base.getType();
+    auto *baseDecl = baseTy->getAsCXXRecordDecl();
+    if (!baseDecl)
+      continue;
+    if (baseDecl->getCanonicalDecl() == spec->getCanonicalDecl()) {
+      auto args = getWrittenTemplateArgs(baseTy, spec);
+      if (!args.empty())
+        return args;
+      continue;
+    }
+    auto args = findWrittenTemplateArgsInBases(baseDecl, spec, depth + 1);
+    if (!args.empty())
+      return args;
+  }
+  return {};
+}
+
+/// Clang canonicalizes the template arguments of class template
+/// specializations, so inside \c S<size_t> a member \c typedef T value_type;
+/// has the type \c SubstTemplateTypeParmType(T -> unsigned long), and the
+/// \c size_t sugar is lost. This matters to Swift because \c size_t is imported
+/// as \c Int whereas \c unsigned long is imported as \c UInt.
+///
+/// If \p typedefDecl is such a member typedef, substitute the corresponding
+/// argument from \p writtenArgs (the template arguments as written at some
+/// use site of the specialization) into its underlying type.
+static clang::QualType
+resugarTemplateMemberTypedefDecl(clang::ASTContext &ctx,
+                                 const clang::TypedefNameDecl *typedefDecl,
+                                 ArrayRef<clang::TemplateArgument> writtenArgs) {
+  auto *spec = dyn_cast<clang::ClassTemplateSpecializationDecl>(
+      typedefDecl->getDeclContext());
+  if (!spec)
+    return {};
+  clang::SplitQualType underlying = typedefDecl->getUnderlyingType().split();
+  auto *subst = dyn_cast<clang::SubstTemplateTypeParmType>(underlying.Ty);
+  if (!subst || subst->getAssociatedDecl() != spec || subst->getPackIndex())
+    return {};
+
+  unsigned index = subst->getIndex();
+  if (index >= writtenArgs.size() ||
+      writtenArgs[index].getKind() != clang::TemplateArgument::Type)
+    return {};
+  clang::QualType written = writtenArgs[index].getAsType();
+  // Only bother if the written argument carries sugar that the specialization
+  // lost, and double-check that we found the right argument.
+  if (written.isCanonical() ||
+      !ctx.hasSameType(written, subst->getReplacementType()))
+    return {};
+  return ctx.getQualifiedType(written, underlying.Quals);
+}
+
+/// Returns the class template specialization that \p typedefDecl is a member
+/// of, if it is one whose member typedefs are candidates for resugaring.
+static const clang::ClassTemplateSpecializationDecl *
+getResugarableSpecialization(const clang::TypedefNameDecl *typedefDecl) {
+  auto *spec = dyn_cast<clang::ClassTemplateSpecializationDecl>(
+      typedefDecl->getDeclContext());
+  // Explicit specializations are written out by hand, so their members already
+  // carry whatever sugar the user wrote.
+  if (!spec ||
+      spec->getSpecializationKind() == clang::TSK_ExplicitSpecialization ||
+      spec->getSpecializationKind() == clang::TSK_Undeclared)
+    return nullptr;
+  // Template parameter indices of a partial specialization do not line up
+  // with the template arguments as written.
+  if (isa<clang::ClassTemplatePartialSpecializationDecl *>(
+          spec->getSpecializedTemplateOrPartial()))
+    return nullptr;
+  return spec;
+}
+
+clang::QualType
+ClangImporter::Implementation::resugarInheritedTemplateMemberTypedef(
+    const clang::TypedefNameDecl *typedefDecl,
+    const clang::CXXRecordDecl *derived) {
+  auto *spec = getResugarableSpecialization(typedefDecl);
+  if (!spec || !derived)
+    return {};
+  return resugarTemplateMemberTypedefDecl(
+      getClangASTContext(), typedefDecl,
+      findWrittenTemplateArgsInBases(derived, spec));
+}
+
+/// If \p type refers to a member typedef of a class template specialization,
+/// try to recover the template argument as it was written at the use site
+/// \p useSite, either from the typedef's qualifier (\c S<size_t>::value_type)
+/// or, for unqualified names inherited from a base class
+/// (\c struct D : S<size_t> { void f(value_type); }), from the base specifier
+/// of an enclosing class.
+static clang::QualType
+resugarTemplateMemberTypedef(clang::ASTContext &ctx,
+                             const clang::TypedefType *type,
+                             const clang::Decl *useSite) {
+  auto *typedefDecl = type->getDecl();
+  auto *spec = getResugarableSpecialization(typedefDecl);
+  if (!spec)
+    return {};
+
+  ArrayRef<clang::TemplateArgument> writtenArgs;
+  auto qualifier = type->getQualifier();
+  if (qualifier.getKind() == clang::NestedNameSpecifier::Kind::Type) {
+    // S<size_t>::value_type, or D::value_type where D derives from S<size_t>.
+    clang::QualType qualifierTy(qualifier.getAsType(), 0);
+    writtenArgs = getWrittenTemplateArgs(qualifierTy, spec);
+    if (writtenArgs.empty())
+      writtenArgs = findWrittenTemplateArgsInBases(
+          qualifierTy->getAsCXXRecordDecl(), spec);
+  } else if (!qualifier && useSite) {
+    // An unqualified name found via lookup into the bases of an enclosing
+    // class.
+    for (auto *dc = useSite->getDeclContext(); dc && writtenArgs.empty();
+         dc = dc->getParent())
+      if (auto *record = dyn_cast<clang::CXXRecordDecl>(dc))
+        writtenArgs = findWrittenTemplateArgsInBases(record, spec);
+  }
+  return resugarTemplateMemberTypedefDecl(ctx, typedefDecl, writtenArgs);
+}
+
+/// Apply \c resugarTemplateMemberTypedef to \p type, looking through pointers,
+/// references, and qualifiers. Returns a null type if nothing changed.
+static clang::QualType
+resugarTemplateMemberTypedefsInType(clang::ASTContext &ctx, clang::QualType type,
+                                    const clang::Decl *useSite) {
+  if (type.isNull())
+    return {};
+  clang::SplitQualType split = type.split();
+  clang::QualType result;
+  if (auto *typedefTy = dyn_cast<clang::TypedefType>(split.Ty)) {
+    result = resugarTemplateMemberTypedef(ctx, typedefTy, useSite);
+  } else if (auto *ptrTy = dyn_cast<clang::PointerType>(split.Ty)) {
+    auto pointee =
+        resugarTemplateMemberTypedefsInType(ctx, ptrTy->getPointeeType(), useSite);
+    if (!pointee.isNull())
+      result = ctx.getPointerType(pointee);
+  } else if (auto *refTy = dyn_cast<clang::LValueReferenceType>(split.Ty)) {
+    auto pointee = resugarTemplateMemberTypedefsInType(
+        ctx, refTy->getPointeeTypeAsWritten(), useSite);
+    if (!pointee.isNull())
+      result = ctx.getLValueReferenceType(pointee, refTy->isSpelledAsLValue());
+  } else if (auto *refTy = dyn_cast<clang::RValueReferenceType>(split.Ty)) {
+    auto pointee = resugarTemplateMemberTypedefsInType(
+        ctx, refTy->getPointeeTypeAsWritten(), useSite);
+    if (!pointee.isNull())
+      result = ctx.getRValueReferenceType(pointee);
+  }
+  if (result.isNull())
+    return {};
+  return ctx.getQualifiedType(result, split.Quals);
+}
+
+clang::QualType ClangImporter::Implementation::resugarTemplateMemberTypedefs(
+    clang::QualType type, const clang::Decl *useSite) {
+  return resugarTemplateMemberTypedefsInType(getClangASTContext(), type, useSite);
+}
+
 ImportedType ClangImporter::Implementation::importFunctionReturnType(
     DeclContext *dc, const clang::FunctionDecl *clangDecl,
     bool allowNSUIntegerAsInt) {
@@ -2391,6 +2579,9 @@ ImportedType ClangImporter::Implementation::importFunctionReturnType(
 
   clang::QualType returnType = desugarIfElaborated(clangDecl->getReturnType());
   returnType = desugarIfBoundsAttributed(returnType);
+  if (auto resugared = resugarTemplateMemberTypedefs(returnType, clangDecl);
+      !resugared.isNull())
+    returnType = resugared;
   // In C interop mode, the return type of library builtin functions
   // like 'memcpy' from headers like 'string.h' drops
   // any nullability specifiers from their return type, and preserves it on the
@@ -2639,6 +2830,9 @@ ClangImporter::Implementation::importParameterType(
     llvm::function_ref<void(Diagnostic &&)> addImportDiagnosticFn) {
   auto paramTy = desugarIfElaborated(param->getType());
   paramTy = desugarIfBoundsAttributed(paramTy);
+  if (auto resugared = resugarTemplateMemberTypedefs(paramTy, parent);
+      !resugared.isNull())
+    paramTy = resugared;
 
   // If this type has a _Nullable/_Nonnull attribute, drop it, since we already
   // have that information in optionalityOfParam.

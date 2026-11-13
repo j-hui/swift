@@ -7034,7 +7034,29 @@ static ValueDecl *cloneBaseMemberDecl(ClangImporter::Implementation &Impl,
         TypeAliasDecl(typeAlias->getStartLoc(), typeAlias->getEqualLoc(),
                       typeAlias->getName(), typeAlias->getNameLoc(),
                       typeAlias->getGenericParams(), newContext);
-    out->setUnderlyingType(typeAlias->getUnderlyingType());
+    Type underlying = typeAlias->getUnderlyingType();
+    // If this is a member typedef of a class template specialization, the
+    // derived class's base specifier may carry template argument sugar that
+    // the specialization lost, e.g., size_t (Int) vs. unsigned long (UInt).
+    if (auto *typedefDecl = dyn_cast_or_null<clang::TypedefNameDecl>(
+            typeAlias->getClangDecl())) {
+      auto *derived = dyn_cast_or_null<clang::CXXRecordDecl>(
+          newContext->getAsDecl() ? newContext->getAsDecl()->getClangDecl()
+                                  : nullptr);
+      if (auto resugared =
+              Impl.resugarInheritedTemplateMemberTypedef(typedefDecl, derived);
+          !resugared.isNull()) {
+        if (auto resugaredTy = Impl.importTypeIgnoreIUO(
+                resugared, ImportTypeKind::Typedef,
+                ImportDiagnosticAdder(Impl, typedefDecl,
+                                      typedefDecl->getLocation()),
+                isInSystemModule(newContext),
+                getTypedefBridgeability(typedefDecl),
+                getImportTypeAttrs(typedefDecl), OTK_Optional))
+          underlying = resugaredTy;
+      }
+    }
+    out->setUnderlyingType(underlying);
     out->setAccess(access);
     inheritance.setUnavailableIfNecessary(decl, out);
     return out;

@@ -4921,12 +4921,18 @@ namespace {
         importedType = ImportedType(closureType, false);
       }
 
-      if (!importedType)
+      if (!importedType) {
+        clang::QualType clangFieldType = decl->getType();
+        if (auto resugared =
+                Impl.resugarTemplateMemberTypedefs(clangFieldType, decl);
+            !resugared.isNull())
+          clangFieldType = resugared;
         importedType =
-            Impl.importType(decl->getType(), ImportTypeKind::RecordField,
+            Impl.importType(clangFieldType, ImportTypeKind::RecordField,
                             ImportDiagnosticAdder(Impl, decl, decl->getLocation()),
                             isInSystemModule(dc), Bridgeability::None,
                             getImportTypeAttrs(decl));
+      }
       if (!importedType) {
         Impl.addImportDiagnostic(
             decl, Diagnostic(diag::record_field_not_imported, decl),

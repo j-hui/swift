@@ -1748,6 +1748,28 @@ public:
                                         const clang::FunctionDecl *clangDecl,
                                         bool allowNSUIntegerAsInt);
 
+  /// Clang canonicalizes the template arguments of class template
+  /// specializations, so inside \c S<size_t>, a member \c typedef T NUMBER;
+  /// is \c unsigned long rather than \c size_t (and thus would be imported as
+  /// \c UInt rather than \c Int).
+  ///
+  /// If \p type refers to such a member typedef (possibly through pointers and
+  /// references), try to recover the template argument as written at the use
+  /// site \p useSite, e.g., from \c S<size_t>::NUMBER or from the base
+  /// specifier of a class deriving from \c S<size_t>.
+  ///
+  /// \returns the resugared type, or a null type if nothing changed.
+  clang::QualType resugarTemplateMemberTypedefs(clang::QualType type,
+                                                const clang::Decl *useSite);
+
+  /// Like \c resugarTemplateMemberTypedefs, but for the underlying type of the
+  /// member typedef \p typedefDecl as inherited by the class \p derived.
+  ///
+  /// \returns the resugared type, or a null type if nothing changed.
+  clang::QualType
+  resugarInheritedTemplateMemberTypedef(const clang::TypedefNameDecl *typedefDecl,
+                                        const clang::CXXRecordDecl *derived);
+
   /// Import the parameter list for a function
   ///
   /// \param clangDecl The underlying declaration, if any; should only be

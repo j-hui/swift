@@ -212,3 +212,8 @@ module FunctionTemplateNullability {
   header "function-template-nullability.h"
   requires cplusplus
 }
+
+module ClassTemplateMemberTypedefSugar {
+  header "class-template-member-typedef-sugar.h"
+  requires cplusplus
+}
